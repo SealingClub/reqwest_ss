@@ -27,7 +27,7 @@ features = [
 ]
 
 [features]
-default = ["default-tls", "charset", "http2", "macos-system-configuration"]
+default = ["default-tls", "charset", "http2", "macos-system-configuration", "shadowsocks"]
 
 # Note: this doesn't enable the 'native-tls' feature, which adds specific
 # functionality for it.
@@ -73,6 +73,8 @@ hickory-dns = ["dep:hickory-resolver"]
 stream = ["tokio/fs", "dep:tokio-util", "dep:wasm-streams"]
 
 socks = ["dep:tokio-socks"]
+
+shadowsocks = ["dep:shadowsocks"]
 
 # Use the system's proxy configuration.
 macos-system-configuration = ["dep:system-configuration"]
@@ -155,6 +157,9 @@ tokio-util = { version = "0.7.9", default-features = false, features = ["codec",
 
 ## socks
 tokio-socks = { version = "0.5.2", optional = true }
+
+## shadowsocks
+shadowsocks = { version = "1.17.2", default-features = false, features = ["aead-cipher-2022-extra"], optional = true }
 
 ## hickory-dns
 hickory-resolver = { version = "0.24", optional = true, features = ["tokio-runtime"] }

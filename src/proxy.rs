@@ -1,5 +1,5 @@
 use std::fmt;
-#[cfg(feature = "socks")]
+#[cfg(any(feature = "socks", feature = "shadowsocks"))]
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -61,6 +61,21 @@ use system_configuration::{
 /// # Ok(())
 /// # }
 /// ```
+///
+/// By enabling the `"shadowsocks"` feature it is possible to use a shadowsocks proxy:
+/// ```rust
+/// # fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let proxy = reqwest::Proxy::http("ss://method:password@192.168.1.1:9000")?;
+/// # Ok(())
+/// # }
+/// ```
+/// or you can encode `method:password` with base64:
+/// ```rust
+/// # fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let proxy = reqwest::Proxy::http("ss://YmYtY2ZiOnRlc3Q@192.168.1.2:8080")?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct Proxy {
     intercept: Intercept,
@@ -112,13 +127,22 @@ pub enum ProxyScheme {
         auth: Option<(String, String)>,
         remote_dns: bool,
     },
+    // SS-URI = "ss://" userinfo "@" hostname ":" port [ "/" ] [ "?" plugin ] [ "#" tag ]
+    // userinfo = websafe-base64-encode-utf8(method  ":" password)
+    #[cfg(feature = "shadowsocks")]
+    Shadowsocks {
+        addr: SocketAddr,
+        auth: (shadowsocks::crypto::CipherKind, String),
+        plugin: Option<String>,
+        tag: Option<String>,
+    },
 }
 
 impl ProxyScheme {
     fn maybe_http_auth(&self) -> Option<&HeaderValue> {
         match self {
             ProxyScheme::Http { auth, .. } | ProxyScheme::Https { auth, .. } => auth.as_ref(),
-            #[cfg(feature = "socks")]
+            #[cfg(any(feature = "socks", feature = "shadowsocks"))]
             _ => None,
         }
     }
@@ -614,6 +638,54 @@ impl ProxyScheme {
         })
     }
 
+    /// Proxy traffic via the specified socket address over Shadowsocks
+    ///
+    /// Shadowsocks is a more secure proxy protocol that encrypts the traffic.
+    ///
+    /// According to the Shadowsocks protocol, if no password is provided,
+    /// the chiper would be considered to be a base64-encoded `method:password`
+    #[cfg(feature = "shadowsocks")]
+    fn shadowsocks(addr: SocketAddr, chiper: &str, password: Option<&str>) -> crate::Result<Self> {
+        use base64::{engine, Engine};
+        use shadowsocks::crypto::CipherKind;
+        use std::str::FromStr;
+
+        if let Some(pwd) = password {
+            let password = percent_decode(pwd.as_bytes()).decode_utf8_lossy();
+            let method = CipherKind::from_str(chiper)
+                .map_err(|_| crate::error::builder("Invalid cipher"))?;
+            Ok(ProxyScheme::Shadowsocks {
+                addr,
+                auth: (method, password.to_string()),
+                plugin: None,
+                tag: None,
+            })
+        } else {
+            let decoder = engine::general_purpose::URL_SAFE;
+            let userinfo = decoder
+                .decode(
+                    percent_decode(chiper.as_bytes())
+                        .decode_utf8_lossy()
+                        .as_bytes(),
+                )
+                .map_err(|e| crate::error::builder(e))?;
+            let userinfo = String::from_utf8(userinfo).map_err(|e| crate::error::builder(e))?;
+            let mut parts = userinfo.splitn(2, ":");
+            let method = parts.next().unwrap();
+            let password = parts
+                .next()
+                .ok_or_else(|| crate::error::builder("Miss password"))?;
+            let method = CipherKind::from_str(method)
+                .map_err(|_| crate::error::builder("Invalid cipher"))?;
+            Ok(ProxyScheme::Shadowsocks {
+                addr,
+                auth: (method, password.to_string()),
+                plugin: None,
+                tag: None,
+            })
+        }
+    }
+
     /// Use a username and password when connecting to the proxy server
     fn with_basic_auth<T: Into<String>, U: Into<String>>(
         mut self,
@@ -642,6 +714,9 @@ impl ProxyScheme {
             ProxyScheme::Socks5 { ref mut auth, .. } => {
                 *auth = Some((username.into(), password.into()));
             }
+            #[cfg(feature = "shadowsocks")]
+            // has been set in the shadowsocks()
+            ProxyScheme::Shadowsocks { .. } => {}
         }
     }
 
@@ -659,7 +734,11 @@ impl ProxyScheme {
             }
             #[cfg(feature = "socks")]
             ProxyScheme::Socks5 { .. } => {
-                panic!("Socks5 is not supported for this method")
+                panic!("Socks is not supported for this method")
+            }
+            #[cfg(feature = "shadowsocks")]
+            ProxyScheme::Shadowsocks { .. } => {
+                panic!("Shadowsocks is not supported for this method")
             }
         }
     }
@@ -680,6 +759,8 @@ impl ProxyScheme {
             ProxyScheme::Socks4 { .. } => {}
             #[cfg(feature = "socks")]
             ProxyScheme::Socks5 { .. } => {}
+            #[cfg(feature = "shadowsocks")]
+            ProxyScheme::Shadowsocks { .. } => {}
         }
 
         self
@@ -687,17 +768,17 @@ impl ProxyScheme {
 
     /// Convert a URL into a proxy scheme
     ///
-    /// Supported schemes: HTTP, HTTPS, (SOCKS4, SOCKS5, SOCKS5H if `socks` feature is enabled).
+    /// Supported schemes: HTTP, HTTPS, (SOCKS4, SOCKS5, SOCKS5H if `socks` feature is enabled, shadowsocks if `shadowsocks` feature is enabled).
     // Private for now...
     fn parse(url: Url) -> crate::Result<Self> {
         use url::Position;
 
         // Resolve URL to a host and port
-        #[cfg(feature = "socks")]
+        #[cfg(any(feature = "socks", feature = "shadowsocks"))]
         let to_addr = || {
             let addrs = url
                 .socket_addrs(|| match url.scheme() {
-                    "socks4" | "socks5" | "socks5h" => Some(1080),
+                    "socks4" | "socks5" | "socks5h" | "ss" => Some(1080),
                     _ => None,
                 })
                 .map_err(crate::error::builder)?;
@@ -716,6 +797,8 @@ impl ProxyScheme {
             "socks5" => Self::socks5(to_addr()?)?,
             #[cfg(feature = "socks")]
             "socks5h" => Self::socks5h(to_addr()?)?,
+            #[cfg(feature = "shadowsocks")]
+            "ss" => Self::shadowsocks(to_addr()?, url.username(), url.password())?,
             _ => return Err(crate::error::builder("unknown proxy scheme")),
         };
 
@@ -737,6 +820,8 @@ impl ProxyScheme {
             ProxyScheme::Socks4 { .. } => "socks4",
             #[cfg(feature = "socks")]
             ProxyScheme::Socks5 { .. } => "socks5",
+            #[cfg(feature = "shadowsocks")]
+            ProxyScheme::Shadowsocks { .. } => "shadowsocks",
         }
     }
 
@@ -749,6 +834,8 @@ impl ProxyScheme {
             ProxyScheme::Socks4 { .. } => panic!("socks4"),
             #[cfg(feature = "socks")]
             ProxyScheme::Socks5 { .. } => panic!("socks5"),
+            #[cfg(feature = "shadowsocks")]
+            ProxyScheme::Shadowsocks { .. } => panic!("shadowsocks"),
         }
     }
 }
@@ -770,6 +857,17 @@ impl fmt::Debug for ProxyScheme {
             } => {
                 let h = if *remote_dns { "h" } else { "" };
                 write!(f, "socks5{h}://{addr}")
+            }
+            #[cfg(feature = "shadowsocks")]
+            ProxyScheme::Shadowsocks {
+                addr,
+                auth,
+                plugin,
+                tag,
+            } => {
+                let plugin = plugin.as_ref().map_or("", |p| p.as_str());
+                let tag = tag.as_ref().map_or("", |t| t.as_str());
+                write!(f, "ss://{}:******@{addr}/{plugin}?{tag}", auth.0)
             }
         }
     }
@@ -1148,6 +1246,8 @@ mod tests {
             ProxyScheme::Https { host, .. } => ("https", host),
             #[cfg(feature = "socks")]
             _ => panic!("intercepted as socks"),
+            #[cfg(feature = "shadowsocks")]
+            _ => panic!("intercepted as shadowsocks"),
         };
         http::Uri::builder()
             .scheme(scheme)

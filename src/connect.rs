@@ -216,6 +216,10 @@ impl Connector {
             ProxyScheme::Http { .. } | ProxyScheme::Https { .. } => {
                 unreachable!("connect_socks is only called for socks proxies");
             }
+            #[cfg(feature = "shadowsocks")]
+            ProxyScheme::Shadowsocks { .. } => {
+                unreachable!("connect_socks is only called for socks proxies");
+            }
         };
 
         match &self.inner {
@@ -267,6 +271,77 @@ impl Connector {
 
         socks::connect(proxy, dst, dns).await.map(|tcp| Conn {
             inner: self.verbose.wrap(TokioIo::new(tcp)),
+            is_proxy: false,
+            tls_info: false,
+        })
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    async fn connect_shadowsocks(&self, dst: Uri, proxy: ProxyScheme) -> Result<Conn, BoxError> {
+        let (server_addr, (method, passwd)) = match proxy {
+            ProxyScheme::Shadowsocks { addr, auth, .. } => (addr, auth),
+            ProxyScheme::Http { .. } | ProxyScheme::Https { .. } => {
+                unreachable!("connect_shadowsocks is only called for shadowsocks proxies");
+            }
+            #[cfg(feature = "socks")]
+            ProxyScheme::Socks5 { .. } => {
+                unreachable!("connect_shadowsocks is only called for shadowsocks proxies");
+            }
+        };
+        let mut svr_cfg = sssokcs::ServerConfig::new(server_addr, passwd, method);
+        svr_cfg.set_mode(sssokcs::Mode::TcpOnly);
+        let context = Arc::new(sssokcs::SsContext::new(sssokcs::ServerType::Local));
+        //TODO : custom dns
+        let stream = sssokcs::connect(context, svr_cfg, dst.clone()).await;
+
+        match &self.inner {
+            #[cfg(feature = "default-tls")]
+            Inner::DefaultTls(_http, tls) => {
+                if dst.scheme() == Some(&Scheme::HTTPS) {
+                    let host = dst.host().ok_or("no host in url")?.to_string();
+                    let conn = TokioIo::new(stream);
+                    let conn = TokioIo::new(conn);
+                    let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
+                    let io = tls_connector.connect(&host, conn).await?;
+                    let io = TokioIo::new(io);
+                    return Ok(Conn {
+                        inner: self.verbose.wrap(NativeTlsConn { inner: io }),
+                        is_proxy: false,
+                        tls_info: self.tls_info,
+                    });
+                }
+            }
+            #[cfg(feature = "__rustls")]
+            Inner::RustlsTls { tls, .. } => {
+                if dst.scheme() == Some(&Scheme::HTTPS) {
+                    use std::convert::TryFrom;
+                    use tokio_rustls::TlsConnector as RustlsConnector;
+
+                    let tls = tls.clone();
+                    let host = dst.host().ok_or("no host in url")?.to_string();
+                    // let conn = socks::connect(proxy, dst, dns).await?;
+                    let conn = TokioIo::new(stream);
+                    let conn = TokioIo::new(conn);
+                    let server_name =
+                        rustls_pki_types::ServerName::try_from(host.as_str().to_owned())
+                            .map_err(|_| "Invalid Server Name")?;
+                    let io = RustlsConnector::from(tls)
+                        .connect(server_name, conn)
+                        .await?;
+                    let io = TokioIo::new(io);
+                    return Ok(Conn {
+                        inner: self.verbose.wrap(RustlsTlsConn { inner: io }),
+                        is_proxy: false,
+                        tls_info: false,
+                    });
+                }
+            }
+            #[cfg(not(feature = "__tls"))]
+            Inner::Http(_) => (),
+        }
+
+        Ok(Conn {
+            inner: self.verbose.wrap(TokioIo::new(stream)),
             is_proxy: false,
             tls_info: false,
         })
@@ -371,6 +446,10 @@ impl Connector {
             ProxyScheme::Socks4 { .. } => return self.connect_socks(dst, proxy_scheme).await,
             #[cfg(feature = "socks")]
             ProxyScheme::Socks5 { .. } => return self.connect_socks(dst, proxy_scheme).await,
+            #[cfg(feature = "shadowsocks")]
+            ProxyScheme::Shadowsocks { .. } => {
+                return self.connect_shadowsocks(dst, proxy_scheme).await
+            }
         };
 
         #[cfg(feature = "__tls")]
@@ -535,7 +614,9 @@ impl<T: TlsInfoFactory> TlsInfoFactory for TokioIo<T> {
 }
 
 #[cfg(feature = "default-tls")]
-impl TlsInfoFactory for tokio_native_tls::TlsStream<TokioIo<TokioIo<tokio::net::TcpStream>>> {
+impl<T: TlsInfoFactory + tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> TlsInfoFactory
+    for tokio_native_tls::TlsStream<TokioIo<TokioIo<T>>>
+{
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         let peer_certificate = self
             .get_ref()
@@ -575,7 +656,9 @@ impl TlsInfoFactory for hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::TcpStrea
 }
 
 #[cfg(feature = "__rustls")]
-impl TlsInfoFactory for tokio_rustls::client::TlsStream<TokioIo<TokioIo<tokio::net::TcpStream>>> {
+impl<T: TlsInfoFactory + tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> TlsInfoFactory
+    for tokio_rustls::client::TlsStream<TokioIo<TokioIo<T>>>
+{
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         let peer_certificate = self
             .get_ref()
@@ -812,7 +895,10 @@ mod native_tls_conn {
         }
     }
 
-    impl Connection for NativeTlsConn<TokioIo<TokioIo<TcpStream>>> {
+    impl<T> Connection for NativeTlsConn<TokioIo<TokioIo<T>>>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Connection,
+    {
         fn connected(&self) -> Connected {
             let connected = self
                 .inner
@@ -936,7 +1022,10 @@ mod rustls_tls_conn {
         }
     }
 
-    impl Connection for RustlsTlsConn<TokioIo<TokioIo<TcpStream>>> {
+    impl<T> Connection for RustlsTlsConn<TokioIo<TokioIo<T>>>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Connection,
+    {
         fn connected(&self) -> Connected {
             if self.inner.inner().get_ref().1.alpn_protocol() == Some(b"h2") {
                 self.inner
@@ -1094,6 +1183,132 @@ mod socks {
             }
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(feature = "shadowsocks")]
+mod sssokcs {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    use hyper::Uri;
+    use hyper_util::client::legacy::connect::{Connected, Connection};
+    use pin_project_lite::pin_project;
+    pub(super) use shadowsocks::config::{Mode, ServerConfig, ServerType};
+    pub(super) use shadowsocks::context::Context as SsContext;
+    use shadowsocks::relay::tcprelay::proxy_stream::client::ProxyClientStream;
+    use tokio::io::{AsyncRead, AsyncWrite};
+    use tower_service::Service;
+
+    use crate::error::BoxError;
+
+    #[cfg(feature = "__tls")]
+    use super::TlsInfoFactory;
+
+    pin_project! {
+        pub(super) struct ShadowsocksConn<T> {
+            #[pin] pub(super) inner: T,
+        }
+    }
+
+    struct ShadowsocksConnector {
+        context: Arc<SsContext>,
+        svr_cfg: ServerConfig,
+    }
+
+    #[cfg(feature = "__tls")]
+    impl TlsInfoFactory for ShadowsocksConn<ProxyClientStream<shadowsocks::net::TcpStream>> {
+        fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+            None
+        }
+    }
+
+    impl Connection for ShadowsocksConn<ProxyClientStream<shadowsocks::net::TcpStream>> {
+        fn connected(&self) -> Connected {
+            Connected::new()
+        }
+    }
+
+    impl<S> AsyncRead for ShadowsocksConn<S>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.project();
+            this.inner.poll_read(cx, buf)
+        }
+    }
+
+    impl<S> AsyncWrite for ShadowsocksConn<S>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            let this = self.project();
+            this.inner.poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            let this = self.project();
+            this.inner.poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            let this = self.project();
+            this.inner.poll_shutdown(cx)
+        }
+    }
+
+    impl tower_service::Service<Uri> for ShadowsocksConnector {
+        type Response = ShadowsocksConn<ProxyClientStream<shadowsocks::net::TcpStream>>;
+
+        type Error = BoxError;
+
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Uri) -> Self::Future {
+            let context = self.context.clone();
+            let svr_cfg = self.svr_cfg.clone();
+            let port = match req.scheme_str() {
+                Some("http") => req.port_u16().unwrap_or(80),
+                Some("https") => req.port_u16().unwrap_or(443),
+                _ => req.port_u16().unwrap_or(80),
+            };
+            Box::pin(async move {
+                let host = req.host().ok_or("no host in url")?.to_string();
+                let stream = ProxyClientStream::connect(context, &svr_cfg, (host, port)).await?;
+                Ok(ShadowsocksConn { inner: stream })
+            })
+        }
+    }
+
+    pub(super) async fn connect(
+        context: Arc<SsContext>,
+        svr_cfg: ServerConfig,
+        dst: Uri,
+    ) -> ShadowsocksConn<ProxyClientStream<shadowsocks::net::TcpStream>> {
+        let mut ssconnector = ShadowsocksConnector { context, svr_cfg };
+        ssconnector.call(dst).await.unwrap()
     }
 }
 
